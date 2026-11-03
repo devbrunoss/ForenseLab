@@ -19,8 +19,9 @@ services:
       - key: CORS_ORIGINS
         value: http://localhost:5173
 
-  - type: static
+  - type: web
     name: forenselab-web
+    runtime: static
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
