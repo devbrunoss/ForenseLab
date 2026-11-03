@@ -17,7 +17,7 @@ services:
       - key: DATABASE_URL
         value: sqlite:////tmp/forenselab.db
       - key: CORS_ORIGINS
-        value: http://localhost:5173
+        value: https://forenselab-web.onrender.com
 
   - type: web
     name: forenselab-web
@@ -27,9 +27,6 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE_URL
-        fromService:
-          type: web
-          name: forenselab-api
-          property: host
+        value: https://forenselab-api.onrender.com
       - key: VITE_DEMO_MODE
         value: "true"
