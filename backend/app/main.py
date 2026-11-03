@@ -1,94 +1,253 @@
-import hashlib,uuid,json,html
+import hashlib
+import html
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime,timezone
-from fastapi import FastAPI,Depends,UploadFile,File,HTTPException
+
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel,Field
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from sqlalchemy import select,func
-from .db import Base,engine,get_db
-from .models import Case,Evidence,Audit,Timeline
-from .config import STORAGE,MAX_UPLOAD
+
+from .config import CORS_ORIGINS, DEMO_MODE, MAX_UPLOAD, ROOT, STORAGE
+from .db import Base, Session as SessionLocal, engine, get_db
+from .models import Audit, Case, Evidence, Timeline
+
 Base.metadata.create_all(bind=engine)
-app=FastAPI(title="ForenseLab API",version="1.0.0")
-app.add_middleware(CORSMiddleware,allow_origins=["http://localhost:5173"],allow_methods=["GET","POST","PATCH"],allow_headers=["*"])
-def log(db,case_id,action,description):
-    db.add(Audit(case_id=case_id,action=action,description=description))
+
+app = FastAPI(title="ForenseLab API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["*"],
+)
+
+
+def seed_demo_data():
+    """Create one synthetic case on first boot of an empty demo database."""
+    if not DEMO_MODE:
+        return
+
+    db = SessionLocal()
+    try:
+        if db.scalar(select(func.count()).select_from(Case)):
+            return
+
+        sample = ROOT / "examples" / "synthetic-lab" / "sample-note.txt"
+        if not sample.is_file():
+            return
+
+        STORAGE.mkdir(parents=True, exist_ok=True)
+        storage_name = f"{uuid.uuid4().hex}.bin"
+        content = sample.read_bytes()
+        (STORAGE / storage_name).write_bytes(content)
+
+        case = Case(
+            title="Caso demonstrativo — Amostra sintética",
+            description="Caso fictício criado automaticamente para apresentar as funcionalidades do ForenseLab. Não representa uma investigação real.",
+            priority="low",
+        )
+        db.add(case)
+        db.flush()
+
+        evidence = Evidence(
+            case_id=case.id,
+            original_name="sample-note.txt",
+            storage_name=storage_name,
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        db.add(evidence)
+        db.add(Timeline(
+            case_id=case.id,
+            occurred_at=datetime.now(timezone.utc),
+            description="Amostra sintética importada para demonstração.",
+            source="Laboratório demonstrativo ForenseLab",
+        ))
+        db.add(Audit(
+            case_id=case.id,
+            action="demo.initialized",
+            description="Dados sintéticos de demonstração inicializados.",
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+seed_demo_data()
+
+
 class CaseIn(BaseModel):
-    title:str=Field(min_length=1,max_length=200)
-    description:str=""
-    priority:str="medium"
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    priority: str = "medium"
+
+
 class TimelineIn(BaseModel):
-    occurred_at:datetime
-    description:str=Field(min_length=1)
-    source:str="Não informado"
+    occurred_at: datetime
+    description: str = Field(min_length=1)
+    source: str = "Não informado"
+
+
 @app.get("/api/health")
-def health(): return {"status":"ok"}
+def health():
+    return {"status": "ok", "demo_mode": DEMO_MODE}
+
+
+def log(db, case_id, action, description):
+    db.add(Audit(case_id=case_id, action=action, description=description))
+
+
 @app.get("/api/dashboard")
-def dashboard(db:Session=Depends(get_db)):
-    return {"cases":db.scalar(select(func.count()).select_from(Case)) or 0,
-            "evidence":db.scalar(select(func.count()).select_from(Evidence)) or 0,
-            "open":db.scalar(select(func.count()).select_from(Case).where(Case.status=="open")) or 0}
-@app.post("/api/cases",status_code=201)
-def create_case(data:CaseIn,db:Session=Depends(get_db)):
-    c=Case(**data.model_dump());db.add(c);db.flush();log(db,c.id,"case.created","Caso criado");db.commit();db.refresh(c);return c
-@app.get("/api/cases")
-def cases(db:Session=Depends(get_db)): return db.scalars(select(Case).order_by(Case.created_at.desc())).all()
-@app.get("/api/cases/{case_id}")
-def case_detail(case_id:str,db:Session=Depends(get_db)):
-    c=db.get(Case,case_id)
-    if not c: raise HTTPException(404,"Caso não encontrado")
+def dashboard(db: Session = Depends(get_db)):
+    return {
+        "cases": db.scalar(select(func.count()).select_from(Case)) or 0,
+        "evidence": db.scalar(select(func.count()).select_from(Evidence)) or 0,
+        "open": db.scalar(select(func.count()).select_from(Case).where(Case.status == "open")) or 0,
+    }
+
+
+@app.post("/api/cases", status_code=201)
+def create_case(data: CaseIn, db: Session = Depends(get_db)):
+    c = Case(**data.model_dump())
+    db.add(c)
+    db.flush()
+    log(db, c.id, "case.created", "Caso criado")
+    db.commit()
+    db.refresh(c)
     return c
+
+
+@app.get("/api/cases")
+def cases(db: Session = Depends(get_db)):
+    return db.scalars(select(Case).order_by(Case.created_at.desc())).all()
+
+
+@app.get("/api/cases/{case_id}")
+def case_detail(case_id: str, db: Session = Depends(get_db)):
+    c = db.get(Case, case_id)
+    if not c:
+        raise HTTPException(404, "Caso não encontrado")
+    return c
+
+
 @app.patch("/api/cases/{case_id}/status")
-def set_status(case_id:str,status:str,db:Session=Depends(get_db)):
-    c=db.get(Case,case_id)
-    if not c: raise HTTPException(404,"Caso não encontrado")
-    if status not in {"open","in_analysis","closed","archived"}: raise HTTPException(422,"Status inválido")
-    c.status=status;log(db,c.id,"case.status_changed",f"Status alterado para {status}");db.commit();return c
-@app.post("/api/cases/{case_id}/evidence",status_code=201)
-async def upload(case_id:str,file:UploadFile=File(...),db:Session=Depends(get_db)):
-    c=db.get(Case,case_id)
-    if not c: raise HTTPException(404,"Caso não encontrado")
-    STORAGE.mkdir(parents=True,exist_ok=True);name=uuid.uuid4().hex+".bin";path=STORAGE/name
-    digest=hashlib.sha256();size=0
+def set_status(case_id: str, status: str, db: Session = Depends(get_db)):
+    c = db.get(Case, case_id)
+    if not c:
+        raise HTTPException(404, "Caso não encontrado")
+    if status not in {"open", "in_analysis", "closed", "archived"}:
+        raise HTTPException(422, "Status inválido")
+    c.status = status
+    log(db, c.id, "case.status_changed", f"Status alterado para {status}")
+    db.commit()
+    return c
+
+
+@app.post("/api/cases/{case_id}/evidence", status_code=201)
+async def upload(case_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    c = db.get(Case, case_id)
+    if not c:
+        raise HTTPException(404, "Caso não encontrado")
+
+    STORAGE.mkdir(parents=True, exist_ok=True)
+    name = uuid.uuid4().hex + ".bin"
+    path = STORAGE / name
+    digest = hashlib.sha256()
+    size = 0
     try:
         with path.open("xb") as out:
-            while chunk:=await file.read(1024*1024):
-                size+=len(chunk)
-                if size>MAX_UPLOAD: raise HTTPException(413,"Limite de upload excedido")
-                digest.update(chunk);out.write(chunk)
+            while chunk := await file.read(256 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD:
+                    raise HTTPException(413, f"Limite de upload excedido ({MAX_UPLOAD} bytes)")
+                digest.update(chunk)
+                out.write(chunk)
     except Exception:
-        path.unlink(missing_ok=True);raise
-    finally: await file.close()
-    e=Evidence(case_id=case_id,original_name=Path(file.filename or "evidence").name[:255],storage_name=name,size=size,sha256=digest.hexdigest())
-    db.add(e);db.flush();log(db,c.id,"evidence.imported",f"Evidência importada: {e.original_name}");db.commit();db.refresh(e)
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    e = Evidence(
+        case_id=case_id,
+        original_name=Path(file.filename or "evidence").name[:255],
+        storage_name=name,
+        size=size,
+        sha256=digest.hexdigest(),
+    )
+    try:
+        db.add(e)
+        db.flush()
+        log(db, c.id, "evidence.imported", f"Evidência importada: {e.original_name}")
+        db.commit()
+        db.refresh(e)
+    except Exception:
+        db.rollback()
+        path.unlink(missing_ok=True)
+        raise
     return e
+
+
 @app.get("/api/cases/{case_id}/evidence")
-def evidence(case_id:str,db:Session=Depends(get_db)):
-    return db.scalars(select(Evidence).where(Evidence.case_id==case_id)).all()
+def evidence(case_id: str, db: Session = Depends(get_db)):
+    if not db.get(Case, case_id):
+        raise HTTPException(404, "Caso não encontrado")
+    return db.scalars(select(Evidence).where(Evidence.case_id == case_id)).all()
+
+
 @app.post("/api/evidence/{evidence_id}/verify")
-def verify(evidence_id:str,db:Session=Depends(get_db)):
-    e=db.get(Evidence,evidence_id)
-    if not e: raise HTTPException(404,"Evidência não encontrada")
-    p=STORAGE/e.storage_name
-    if not p.is_file(): result="unavailable";actual=None
+def verify(evidence_id: str, db: Session = Depends(get_db)):
+    e = db.get(Evidence, evidence_id)
+    if not e:
+        raise HTTPException(404, "Evidência não encontrada")
+    p = STORAGE / e.storage_name
+    if not p.is_file():
+        result = "unavailable"
+        actual = None
     else:
-        h=hashlib.sha256()
+        h = hashlib.sha256()
         with p.open("rb") as f:
-            for chunk in iter(lambda:f.read(1024*1024),b""):h.update(chunk)
-        actual=h.hexdigest();result="intact" if actual==e.sha256 else "divergence"
-    e.integrity_status=result;log(db,e.case_id,"evidence.verified",f"Verificação: {result}");db.commit()
-    return {"result":result,"registered_sha256":e.sha256,"calculated_sha256":actual}
-@app.post("/api/cases/{case_id}/timeline",status_code=201)
-def add_timeline(case_id:str,data:TimelineIn,db:Session=Depends(get_db)):
-    if not db.get(Case,case_id):raise HTTPException(404,"Caso não encontrado")
-    t=Timeline(case_id=case_id,**data.model_dump());db.add(t);log(db,case_id,"timeline.created","Evento de linha do tempo criado");db.commit();db.refresh(t);return t
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        actual = h.hexdigest()
+        result = "intact" if actual == e.sha256 else "divergence"
+    e.integrity_status = result
+    log(db, e.case_id, "evidence.verified", f"Verificação: {result}")
+    db.commit()
+    return {"result": result, "registered_sha256": e.sha256, "calculated_sha256": actual}
+
+
+@app.post("/api/cases/{case_id}/timeline", status_code=201)
+def add_timeline(case_id: str, data: TimelineIn, db: Session = Depends(get_db)):
+    if not db.get(Case, case_id):
+        raise HTTPException(404, "Caso não encontrado")
+    t = Timeline(case_id=case_id, **data.model_dump())
+    db.add(t)
+    log(db, case_id, "timeline.created", "Evento de linha do tempo criado")
+    db.commit()
+    db.refresh(t)
+    return t
+
+
 @app.get("/api/cases/{case_id}/timeline")
-def timeline(case_id:str,db:Session=Depends(get_db)):
-    return db.scalars(select(Timeline).where(Timeline.case_id==case_id).order_by(Timeline.occurred_at)).all()
+def timeline(case_id: str, db: Session = Depends(get_db)):
+    if not db.get(Case, case_id):
+        raise HTTPException(404, "Caso não encontrado")
+    return db.scalars(select(Timeline).where(Timeline.case_id == case_id).order_by(Timeline.occurred_at)).all()
+
+
 @app.get("/api/audit")
-def audit(db:Session=Depends(get_db)): return db.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(300)).all()
+def audit(db: Session = Depends(get_db)):
+    return db.scalars(select(Audit).order_by(Audit.created_at.desc()).limit(300)).all()
+
+
 def build_report(case_id: str, db: Session):
     c = db.get(Case, case_id)
     if not c:
@@ -98,12 +257,18 @@ def build_report(case_id: str, db: Session):
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "case": {"id": c.id, "title": c.title, "description": c.description, "status": c.status},
-        "evidence": [{"name": x.original_name, "size": x.size, "sha256": x.sha256,
-                      "integrity_status": x.integrity_status} for x in ev],
-        "timeline": [{"occurred_at": str(x.occurred_at), "recorded_at": str(x.recorded_at),
-                       "description": x.description, "source": x.source} for x in tl],
-        "limitation": "A correspondência do hash demonstra que o arquivo armazenado corresponde ao hash registrado. Não comprova autenticidade, autoria ou procedência da evidência."
+        "evidence": [
+            {"name": x.original_name, "size": x.size, "sha256": x.sha256, "integrity_status": x.integrity_status}
+            for x in ev
+        ],
+        "timeline": [
+            {"occurred_at": str(x.occurred_at), "recorded_at": str(x.recorded_at),
+             "description": x.description, "source": x.source}
+            for x in tl
+        ],
+        "limitation": "A correspondência do hash demonstra que o arquivo armazenado corresponde ao hash registrado. Não comprova autenticidade, autoria ou procedência da evidência.",
     }
+
 
 @app.get("/api/cases/{case_id}/report.json")
 def report(case_id: str, db: Session = Depends(get_db)):
@@ -111,6 +276,7 @@ def report(case_id: str, db: Session = Depends(get_db)):
     log(db, case_id, "report.generated", "Relatório JSON gerado")
     db.commit()
     return data
+
 
 @app.get("/api/cases/{case_id}/report.html", response_class=HTMLResponse)
 def report_html(case_id: str, db: Session = Depends(get_db)):
