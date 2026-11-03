@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: {context: ./backend}
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - ./storage:/data/evidence
+      - ./data:/data/db
+    environment:
+      DATABASE_URL: sqlite:////data/db/forenselab.db
+      STORAGE_DIR: /data/evidence
+  frontend:
+    image: node:22-alpine
+    working_dir: /web
+    volumes: ["./frontend:/web"]
+    environment:
+      API_PROXY_TARGET: http://backend:8000
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports: ["127.0.0.1:5173:5173"]
+    depends_on: [backend]
